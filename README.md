@@ -190,9 +190,7 @@ Please arrange your dataset directories as follows:
 We provide the pretrained checkpoints needed for **DyFrDet** training setting.
 [Link](https://pan.quark.cn/s/c54571377060?pwd=qimG#/list/share/c12bdc7fd7e445b5b3aea2f5d57013f7)
 
-### 4. Train & Evaluation
 
-#### Modify:
 ### 4. Train & Evaluation
 
 #### Modify Configuration
