@@ -207,7 +207,7 @@ Update `data_root` in the following dataset configuration files:
 
 - `mmrotate-dyfrdet/configs/_base_/datasets/sodaa.py`
 
-**2. Checkpoint Path **
+**1. Checkpoint Path**
 
 Modify the pretrained checkpoint path of DecoupleNet in:
 
