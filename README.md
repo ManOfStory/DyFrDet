@@ -28,7 +28,7 @@
 
 </div>
 
-> **🎉 Accepted by ACM 2026**  
+> **🎉 Accepted by ACMMM 2026**  
 > Official PyTorch implementation of **DyFrDet**.
 
 📌 **Note:** This repository provides the official implementation of DyFrDet, designed to resolve background distractions in the frequency domain and mitigate label ambiguity in small object detection.
