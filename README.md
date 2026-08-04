@@ -22,7 +22,7 @@
 </div>
 <br>
 
-[![📝 arXiv paper](https://img.shields.io/badge/📝_arXiv-Paper-b31b1b.svg)](#)
+[![📝 arXiv paper](https://img.shields.io/badge/📝_arXiv-Paper-b31b1b.svg)](https://arxiv.org/abs/2608.02495)
 
 ---
 
@@ -249,5 +249,13 @@ Special thanks to the authors of [CFINet](https://github.com/shaunyuan22/CFINet)
 ## ✏️ Citation
 If you find this project helpful for your research, please consider leaving a star ⭐️ and citing our paper:
 ```bibtex
-comming soon.
+@misc{yang2026dyfrdetaccuratesmallobject,
+      title={DyFrDet: Towards Accurate Small Object Detection via Dynamic Frequency Suppression with Label Disambiguation}, 
+      author={Zihan Yang and Yang Guo and Hongxing Zhang and Dan Lu and Siyuan Yao},
+      year={2026},
+      eprint={2608.02495},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2608.02495}, 
+}
 ```
