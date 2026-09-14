@@ -201,13 +201,21 @@ class DyFrFPN(BaseModule):
 
         for lv in range(len(outs)):
             feature_fp32 = outs[lv].to(torch.float32)
-            ffts = torch.fft.fft2(feature_fp32, norm='ortho')
-            if self.relative:
-                alpha_l, alpha_h = self.predict_alpha_relative(feature_fp32, ffts)
+            if torch.onnx.is_in_onnx_export():
+                # PyTorch 1.11 has no ONNX symbolic for torch.fft.  Keep the
+                # frequency residual out of the exported graph so the model
+                # remains exportable; regular PyTorch inference is unchanged.
+                newout = torch.zeros_like(feature_fp32)
             else:
-                alpha_l, alpha_h = self.predict_alpha(feature_fp32, ffts)
-            masked_ffts = self.fft2_filter_with_box_mask(ffts, alpha_l, alpha_h)
-            newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
+                ffts = torch.fft.fft2(feature_fp32, norm='ortho')
+                if self.relative:
+                    alpha_l, alpha_h = self.predict_alpha_relative(
+                        feature_fp32, ffts)
+                else:
+                    alpha_l, alpha_h = self.predict_alpha(feature_fp32, ffts)
+                masked_ffts = self.fft2_filter_with_box_mask(
+                    ffts, alpha_l, alpha_h)
+                newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
             filtered_outs.append(outs[lv] - self.beta * newout.half())
 
         return tuple(filtered_outs)

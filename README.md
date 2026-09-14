@@ -233,7 +233,23 @@ python tools/test.py configs/dyfrdet/aitod_detector_dyfrdet_star_2x.py DyFrDet_S
 python tools/test.py configs/dyfrdet/sodaa_detector_dyfrdet_star_1x.py DyFrDet_Rotate_Star/epoch_xxx.pth --eval bbox
 ```
 
-### 5. Model Zoo
+### 5. Export the HBB detector to ONNX
+
+The HBB detector uses a custom two-stage CRPN head. Its ONNX path is implemented in `CRPNHead.onnx_export`, so export the detector through the existing MMDetection deployment script instead of wrapping `simple_test` (which returns Python lists and NumPy arrays):
+
+```bash
+cd mmdet-dyfrdet
+python tools/deployment/pytorch2onnx.py \
+  configs/dyfrdet/aitod_detector_dyfrdet_star_2x.py \
+  DyFrDet_Star/epoch_xxx.pth \
+  --input-img demo/demo.jpg \
+  --output-file DyFrDet_Star/epoch_xxx.onnx \
+  --verify
+```
+
+The exported model has one `input` tensor and two outputs: `dets` with shape `(B, N, 5)` (`x1, y1, x2, y2, score`) and `labels` with shape `(B, N)`. Add `--dynamic-export` when variable batch and image sizes are required. The ONNX branch keeps the detector and CRPN/LDM post-processing in tensor form; because PyTorch 1.11 does not provide an ONNX symbolic for `torch.fft`, DyFrFPN omits its frequency residual during export while regular PyTorch inference keeps the original frequency path. The exporter requires the ONNX dependencies from `mmdet-dyfrdet/requirements.txt` and the same MMCV version used by the checkpoint.
+
+### 6. Model Zoo
 
 We provide the complete pretrained checkpoints for evaluating and reproducing the results of **DyFrDet**. 
 [Link](https://pan.quark.cn/s/c54571377060?pwd=qimG)
