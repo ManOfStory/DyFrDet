@@ -1061,6 +1061,111 @@ class CascadeUncRoIHead(BaseRoIHead, BBoxTestMixin, MaskTestMixin):
             pretrained=pretrained,
             init_cfg=init_cfg)
 
+    def onnx_export(self, x, proposals, img_metas, rescale=False):
+        """Export the cascaded uncertainty bbox branch to ONNX.
+
+        Each cascade stage predicts a mean and variance regression.  The
+        variance is used by training and regular PyTorch inference; ONNX
+        deployment decodes the mean path, refines intermediate RoIs by their
+        predicted class, averages stage classification scores, and delegates
+        final decoding and NMS to the bbox head's ``onnx_export`` method.
+        """
+        assert self.with_bbox, 'Bbox head must be implemented.'
+        det_bboxes, det_labels = self.bbox_onnx_export(
+            x, img_metas, proposals, self.test_cfg, rescale=rescale)
+
+        if not self.with_mask:
+            return det_bboxes, det_labels
+
+        segm_results = self.mask_onnx_export(
+            x, img_metas, det_bboxes, det_labels, rescale=rescale)
+        return det_bboxes, det_labels, segm_results
+
+    def mask_onnx_export(self, x, img_metas, det_bboxes, det_labels,
+                         **kwargs):
+        """Export the final cascade mask head for batched ONNX inference."""
+        assert len(img_metas) == 1, (
+            'Only support one input image while exporting to ONNX')
+        max_shape = img_metas[0]['img_shape_for_onnx']
+        batch_size = det_bboxes.size(0)
+        num_det = det_bboxes.size(1)
+
+        det_bboxes = det_bboxes[..., :4]
+        batch_index = torch.arange(
+            batch_size, device=det_bboxes.device).float().view(-1, 1, 1)
+        batch_index = batch_index.expand(batch_size, num_det, 1)
+        mask_rois = torch.cat([batch_index, det_bboxes], dim=-1).reshape(-1, 5)
+        mask_pred = self._mask_forward(
+            self.num_stages - 1, x, mask_rois)['mask_pred']
+
+        segm_results = self.mask_head[-1].onnx_export(
+            mask_pred, det_bboxes.reshape(-1, 4), det_labels.reshape(-1),
+            self.test_cfg, max_shape)
+        return segm_results.reshape(
+            batch_size, num_det, max_shape[0], max_shape[1])
+
+    def bbox_onnx_export(self, x, img_metas, proposals, rcnn_test_cfg,
+                         **kwargs):
+        """Export all cascade bbox stages to ONNX.
+
+        Args:
+            x (tuple[Tensor]): Feature maps of all scale levels.
+            img_metas (list[dict]): One image metadata entry.  The dynamic
+                image shape is read from ``img_shape_for_onnx``.
+            proposals (Tensor): RPN proposals with shape ``[B, N, 5]``.
+            rcnn_test_cfg (obj:`ConfigDict`): R-CNN test configuration.
+
+        Returns:
+            tuple[Tensor, Tensor]: Detection boxes ``[B, K, 5]`` and labels
+                ``[B, K]`` produced by the final uncertainty bbox head.
+        """
+        assert len(img_metas) == 1, (
+            'Only support one input image while exporting to ONNX')
+        assert proposals.ndim == 3, (
+            'Only support batched proposals while exporting to ONNX')
+
+        img_shapes = img_metas[0]['img_shape_for_onnx']
+        batch_size, num_proposals = proposals.shape[:2]
+        batch_index = torch.arange(
+            batch_size, device=proposals.device).float().view(-1, 1, 1)
+        batch_index = batch_index.expand(batch_size, num_proposals, 1)
+        rois = torch.cat([batch_index, proposals[..., :4]], dim=-1)
+        rois = rois.reshape(-1, 5)
+
+        stage_scores = []
+        final_bbox_pred_mu = None
+        stage_img_meta = dict(img_metas[0])
+        stage_img_meta['img_shape'] = img_shapes
+
+        for stage in range(self.num_stages):
+            bbox_results = self._bbox_forward(stage, x, rois)
+            cls_score = bbox_results['cls_score']
+            bbox_pred_mu = bbox_results['bbox_pred_mu']
+            if not isinstance(bbox_pred_mu, torch.Tensor):
+                raise TypeError(
+                    'ONNX export requires tensor bbox_pred_mu at every '
+                    f'cascade stage, got {type(bbox_pred_mu).__name__}')
+
+            stage_scores.append(cls_score.reshape(
+                batch_size, num_proposals, cls_score.size(-1)))
+            final_bbox_pred_mu = bbox_pred_mu
+
+            if stage < self.num_stages - 1:
+                stage_cls_score = cls_score
+                if self.bbox_head[stage].custom_activation:
+                    stage_cls_score = self.bbox_head[stage].loss_cls.get_activation(
+                        stage_cls_score)
+                bbox_label = stage_cls_score[:, :-1].argmax(dim=1)
+                rois = self.bbox_head[stage].regress_by_class(
+                    rois, bbox_label, bbox_pred_mu, stage_img_meta)
+
+        cls_score = sum(stage_scores) / float(len(stage_scores))
+        final_bbox_pred_mu = final_bbox_pred_mu.reshape(
+            batch_size, num_proposals, final_bbox_pred_mu.size(-1))
+        return self.bbox_head[-1].onnx_export(
+            rois.reshape(batch_size, num_proposals, rois.size(-1)),
+            cls_score, final_bbox_pred_mu, img_shapes, cfg=rcnn_test_cfg)
+
     def init_bbox_head(self, bbox_roi_extractor, bbox_head):
         """Initialize box head and box roi extractor.
 

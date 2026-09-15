@@ -247,7 +247,7 @@ python tools/deployment/pytorch2onnx.py \
   --verify
 ```
 
-The exported model has one `input` tensor and two outputs: `dets` with shape `(B, N, 5)` (`x1, y1, x2, y2, score`) and `labels` with shape `(B, N)`. Add `--dynamic-export` when variable batch and image sizes are required. The ONNX branch keeps the detector and CRPN/LDM post-processing in tensor form; because PyTorch 1.11 does not provide an ONNX symbolic for `torch.fft`, DyFrFPN omits its frequency residual during export while regular PyTorch inference keeps the original frequency path. The exporter requires the ONNX dependencies from `mmdet-dyfrdet/requirements.txt` and the same MMCV version used by the checkpoint.
+The exported model has one `input` tensor and two outputs: `dets` with shape `(B, N, 5)` (`x1, y1, x2, y2, score`) and `labels` with shape `(B, N)`. The ONNX branch keeps the detector, cascade uncertainty regression, CRPN/LDM post-processing, and DyFrFPN frequency residual in tensor form. Since PyTorch 1.11 does not provide an ONNX symbolic for `torch.fft`, DyFrFPN uses an equivalent real-valued DFT/IFFT implementation during export (the regular PyTorch path is unchanged). Models containing MMCV deformable convolutions also require the MMCV ONNX Runtime custom-op library at inference time. Export with the same square input shape and preprocessing used by deployment; the exporter requires the ONNX dependencies from `mmdet-dyfrdet/requirements.txt` and the same MMCV version used by the checkpoint.
 
 ### 6. Model Zoo
 

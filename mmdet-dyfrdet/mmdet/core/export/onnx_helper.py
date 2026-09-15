@@ -69,6 +69,9 @@ def get_k_for_topk(k, size):
                 ret_k = k
         else:
             # Always keep topk op for dynamic input in onnx for ONNX Runtime
+            # Keep both operands on the same device during CUDA tracing.
+            if torch.is_tensor(k):
+                size = torch.as_tensor(size, device=k.device, dtype=k.dtype)
             ret_k = torch.where(k < size, k, size)
     elif k < size:
         ret_k = k
@@ -126,7 +129,8 @@ def add_dummy_nms_for_onnx(boxes,
     if nms_pre > 0:
         max_scores, _ = scores.max(-1)
         _, topk_inds = max_scores.topk(nms_pre)
-        batch_inds = torch.arange(batch_size).view(
+        batch_inds = torch.arange(
+            batch_size, device=max_scores.device).view(
             -1, 1).expand_as(topk_inds).long()
         # Avoid onnx2tensorrt issue in https://github.com/NVIDIA/TensorRT/issues/1134 # noqa: E501
         transformed_inds = boxes.shape[1] * batch_inds + topk_inds
@@ -182,7 +186,8 @@ def add_dummy_nms_for_onnx(boxes,
 
     if nms_after > 0:
         _, topk_inds = scores.topk(nms_after)
-        batch_inds = torch.arange(batch_size).view(-1, 1).expand_as(topk_inds)
+        batch_inds = torch.arange(
+            batch_size, device=scores.device).view(-1, 1).expand_as(topk_inds)
         # Avoid onnx2tensorrt issue in https://github.com/NVIDIA/TensorRT/issues/1134 # noqa: E501
         transformed_inds = scores.shape[1] * batch_inds + topk_inds
         scores = scores.reshape(-1, 1)[transformed_inds, :].reshape(

@@ -111,15 +111,19 @@ class ONNXRuntimeDetector(DeployBaseDetector):
         # register custom op for onnxruntime
         if osp.exists(ort_custom_op_path):
             session_options.register_custom_ops_library(ort_custom_op_path)
-        sess = ort.InferenceSession(onnx_file, session_options)
         providers = ['CPUExecutionProvider']
         options = [{}]
         is_cuda_available = ort.get_device() == 'GPU'
         if is_cuda_available:
             providers.insert(0, 'CUDAExecutionProvider')
             options.insert(0, {'device_id': device_id})
-
-        sess.set_providers(providers, options)
+        # ORT 1.9+ requires providers to be specified at construction time
+        # when more than one execution provider is enabled in the build.
+        sess = ort.InferenceSession(
+            onnx_file,
+            session_options,
+            providers=providers,
+            provider_options=options)
 
         self.sess = sess
         self.io_binding = sess.io_binding()
