@@ -792,3 +792,109 @@ class CRPNHead(BaseDenseHead, BBoxTestMixin):
                                                    bbox_pred, img_metas,
                                                    self.test_cfg)
         return proposal_list
+
+    def onnx_export(self, x, img_metas):
+        """Export the two-stage CRPN proposal path to ONNX.
+
+        ``simple_test_rpn`` returns variable-length Python tensors after
+        batched NMS, which cannot be traced by ``torch.onnx.export``.  Keep the
+        stage refinement and post-processing in tensor form and use the
+        standard ONNX ``NonMaxSuppression`` bridge from MMDetection instead.
+
+        The detector export API supplies one metadata list (the export path is
+        currently intended for one image at a time), while the image tensor
+        keeps its batch dimension.
+        """
+        from mmdet.core.export import add_dummy_nms_for_onnx, get_k_for_topk
+
+        assert len(img_metas) == 1, \
+            'Only support one input image while exporting to ONNX'
+        img_shape = img_metas[0]['img_shape_for_onnx']
+        featmap_sizes = [feat.size()[-2:] for feat in x]
+        batch_size = x[0].size(0)
+
+        # The first CRPN stage uses regular anchors.  Keep one anchor list per
+        # image so the existing offset implementation can be reused by later
+        # stages without passing Python image metadata through the trace.
+        base_anchors = self.stages[0].anchor_generator.grid_anchors(
+            featmap_sizes, device=x[0].device)
+        anchor_list = [base_anchors for _ in range(batch_size)]
+
+        for stage_idx, stage in enumerate(self.stages):
+            if stage.refine_cfg['type'] == 'offset':
+                offset_list = stage.anchor_offset(
+                    anchor_list, stage.anchor_strides, featmap_sizes)
+            else:
+                offset_list = None
+
+            x, cls_scores, bbox_preds = stage(x, offset_list)
+
+            if stage_idx < self.num_stages - 1:
+                # Refine anchors with the current stage's box deltas.  This is
+                # the tensor equivalent of ``refine_bboxes`` for export.
+                refined_anchors = []
+                for image_id in range(batch_size):
+                    image_anchors = []
+                    for level, bbox_pred in enumerate(bbox_preds):
+                        bbox_pred = bbox_pred[image_id].permute(
+                            1, 2, 0).reshape(-1, 4)
+                        image_anchors.append(stage.bbox_coder.decode(
+                            anchor_list[image_id][level], bbox_pred,
+                            max_shape=img_shape))
+                    refined_anchors.append(image_anchors)
+                # anchor_offset expects [batch, levels, anchors, 4].
+                anchor_list = refined_anchors
+
+        cfg = self.test_cfg
+        mlvl_scores = []
+        mlvl_bbox_preds = []
+        mlvl_anchors = []
+        nms_pre_tensor = torch.tensor(
+            cfg.nms_pre, device=x[0].device, dtype=torch.long)
+
+        for level, (cls_score, bbox_pred) in enumerate(
+                zip(cls_scores, bbox_preds)):
+            cls_score = cls_score.permute(0, 2, 3, 1).reshape(
+                batch_size, -1)
+            scores = cls_score.sigmoid()
+            bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(
+                batch_size, -1, 4)
+            anchors = torch.stack(
+                [anchor_list[image_id][level]
+                 for image_id in range(batch_size)], dim=0)
+
+            nms_pre = get_k_for_topk(nms_pre_tensor, bbox_pred.shape[1])
+            if nms_pre > 0:
+                _, topk_inds = scores.topk(nms_pre)
+                batch_inds = torch.arange(batch_size,
+                                          device=scores.device).view(
+                                              -1, 1).expand_as(topk_inds)
+                transformed_inds = scores.shape[1] * batch_inds + topk_inds
+                scores = scores.reshape(-1, 1)[transformed_inds].reshape(
+                    batch_size, -1)
+                bbox_pred = bbox_pred.reshape(-1, 4)[
+                    transformed_inds, :].reshape(batch_size, -1, 4)
+                anchors = anchors.reshape(-1, 4)[
+                    transformed_inds, :].reshape(batch_size, -1, 4)
+
+            mlvl_scores.append(scores)
+            mlvl_bbox_preds.append(bbox_pred)
+            mlvl_anchors.append(anchors)
+
+        scores = torch.cat(mlvl_scores, dim=1)
+        bbox_preds = torch.cat(mlvl_bbox_preds, dim=1)
+        anchors = torch.cat(mlvl_anchors, dim=1)
+        proposals = self.stages[-1].bbox_coder.decode(
+            anchors, bbox_preds, max_shape=img_shape)
+
+        dets, _ = add_dummy_nms_for_onnx(
+            proposals,
+            scores.unsqueeze(2),
+            max_output_boxes_per_class=cfg.max_per_img,
+            iou_threshold=cfg.nms.iou_threshold,
+            score_threshold=cfg.nms.get('score_thr', 0.0),
+            pre_top_k=cfg.get('deploy_nms_pre', -1),
+            after_top_k=cfg.max_per_img)
+        # TwoStageDetector passes the proposal tensor directly to the ROI
+        # head, so unlike a final detector export no labels are returned here.
+        return dets

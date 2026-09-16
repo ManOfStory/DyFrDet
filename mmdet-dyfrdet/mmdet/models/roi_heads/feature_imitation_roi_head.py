@@ -1739,16 +1739,16 @@ class FIRoIUncHead(BaseRoIHead, UncBBoxTestMixin, MaskTestMixin):
         rois = rois.view(-1, 5)
         bbox_results = self._bbox_forward(x, rois)
         cls_score = bbox_results['cls_score']
-        bbox_pred = bbox_results['bbox_pred']
+        bbox_pred_mu = bbox_results['bbox_pred_mu']
 
         # Recover the batch dimension
         rois = rois.reshape(batch_size, num_proposals_per_img, rois.size(-1))
         cls_score = cls_score.reshape(batch_size, num_proposals_per_img,
                                       cls_score.size(-1))
 
-        bbox_pred = bbox_pred.reshape(batch_size, num_proposals_per_img,
-                                      bbox_pred.size(-1))
+        bbox_pred_mu = bbox_pred_mu.reshape(batch_size, num_proposals_per_img,
+                                            bbox_pred_mu.size(-1))
         det_bboxes, det_labels = self.bbox_head.onnx_export(
-            rois, cls_score, bbox_pred, img_shapes, cfg=rcnn_test_cfg)
+            rois, cls_score, bbox_pred_mu, img_shapes, cfg=rcnn_test_cfg)
 
         return det_bboxes, det_labels

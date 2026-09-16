@@ -201,16 +201,184 @@ class DyFrFPN(BaseModule):
 
         for lv in range(len(outs)):
             feature_fp32 = outs[lv].to(torch.float32)
-            ffts = torch.fft.fft2(feature_fp32, norm='ortho')
-            if self.relative:
-                alpha_l, alpha_h = self.predict_alpha_relative(feature_fp32, ffts)
+            if torch.onnx.is_in_onnx_export():
+                # PyTorch 1.11 has no ONNX symbolic for torch.fft.  Express
+                # the same orthonormal FFT, mask and IFFT with real tensors.
+                fft_real, fft_imag = self._fft2_real(feature_fp32)
+                if self.relative:
+                    alpha_l, alpha_h = self.predict_alpha_real(
+                        feature_fp32, fft_real, fft_imag, relative=True)
+                else:
+                    alpha_l, alpha_h = self.predict_alpha_real(
+                        feature_fp32, fft_real, fft_imag, relative=False)
+                filtered_real, filtered_imag = \
+                    self.fft2_filter_with_box_mask_real(
+                        fft_real, fft_imag, alpha_l, alpha_h)
+                newout = self._ifft2_real(
+                    filtered_real, filtered_imag,
+                    output_hw=feature_fp32.shape[-2:])
             else:
-                alpha_l, alpha_h = self.predict_alpha(feature_fp32, ffts)
-            masked_ffts = self.fft2_filter_with_box_mask(ffts, alpha_l, alpha_h)
-            newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
+                ffts = torch.fft.fft2(feature_fp32, norm='ortho')
+                if self.relative:
+                    alpha_l, alpha_h = self.predict_alpha_relative(
+                        feature_fp32, ffts)
+                else:
+                    alpha_l, alpha_h = self.predict_alpha(feature_fp32, ffts)
+                masked_ffts = self.fft2_filter_with_box_mask(
+                    ffts, alpha_l, alpha_h)
+                newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
             filtered_outs.append(outs[lv] - self.beta * newout.half())
 
         return tuple(filtered_outs)
+
+    @staticmethod
+    def _dft_matrix(size, dtype, device, inverse=False):
+        """Build an orthonormal real DFT matrix for ONNX export."""
+        indices = torch.arange(size, dtype=dtype, device=device)
+        phase = (2.0 * 3.141592653589793 / size) * \
+            indices[:, None] * indices[None, :]
+        sign = 1.0 if inverse else -1.0
+        scale = size ** -0.5
+        return (torch.cos(phase) * scale,
+                torch.sin(phase) * (sign * scale))
+
+    def _dft_axis_real(self, real, imag, dim, inverse=False):
+        """Apply a one-dimensional real/imaginary DFT along H or W."""
+        size = real.shape[dim]
+        cos_matrix, sin_matrix = self._dft_matrix(
+            size, real.dtype, real.device, inverse=inverse)
+        transpose_back = dim == -2
+        if transpose_back:
+            real = real.transpose(-2, -1)
+            imag = imag.transpose(-2, -1)
+        real_out = torch.matmul(real, cos_matrix.t()) - \
+            torch.matmul(imag, sin_matrix.t())
+        imag_out = torch.matmul(real, sin_matrix.t()) + \
+            torch.matmul(imag, cos_matrix.t())
+        if transpose_back:
+            real_out = real_out.transpose(-2, -1)
+            imag_out = imag_out.transpose(-2, -1)
+        return real_out, imag_out
+
+    def _fft2_real(self, feature):
+        """ONNX-safe equivalent of ``torch.fft.fft2(..., norm='ortho')``."""
+        real = feature
+        imag = torch.zeros_like(feature)
+        real, imag = self._dft_axis_real(real, imag, -1)
+        return self._dft_axis_real(real, imag, -2)
+
+    def _ifft2_real(self, real, imag, output_hw=None):
+        """ONNX-safe equivalent of ``torch.fft.ifft2(..., norm='ortho')``."""
+        real, imag = self._dft_axis_real(real, imag, -2, inverse=True)
+        real, _ = self._dft_axis_real(real, imag, -1, inverse=True)
+        if output_hw is not None:
+            real = real.reshape(real.shape[0], real.shape[1],
+                                output_hw[0], output_hw[1])
+        return real
+
+    def predict_alpha_real(self, space_feature, fft_real, fft_imag,
+                           relative=False):
+        """Predict frequency bands using only real-valued ONNX operators."""
+        sf = self.sfconv(self._adaptive_pool_combine_real(
+            space_feature, target_size=self.win_size))
+        amp = torch.sqrt(fft_real * fft_real + fft_imag * fft_imag)
+        phase = self._atan2_real(fft_imag, fft_real)
+        amp = self.amp_conv(amp)
+        phase = self.phase_conv(phase)
+        fsf = self._ifft2_real(
+            amp * torch.cos(phase), amp * torch.sin(phase),
+            output_hw=space_feature.shape[-2:])
+        fsf = self.fsfconv(self._adaptive_pool_combine_real(
+            fsf, target_size=self.win_size))
+        fsf = fsf + self.cross_attn(fsf, sf)
+        fsf = fsf.flatten(1)
+        if relative:
+            alpha_l = 0.05 * torch.exp(self.alpha_l_proj(fsf))
+            alpha_h = 0.95 * torch.exp(self.band_del_width_proj(fsf))
+        else:
+            alpha_l = self.relu6(self.alpha_l_proj(fsf)) / 6.0
+            alpha_h = alpha_l + 1 - self.relu6(
+                self.band_del_width_proj(fsf)) / 6.0
+        return (torch.clamp(alpha_l, 0.0, 1.0),
+                torch.clamp(alpha_h, 0.0, 1.0))
+
+    @staticmethod
+    def _atan2_real(y, x):
+        """ONNX-safe equivalent of ``torch.atan2(y, x)``."""
+        pi = 3.141592653589793
+        nonzero_x = x != 0
+        denominator = torch.where(nonzero_x, x, torch.ones_like(x))
+        angle = torch.atan(y / denominator)
+        angle = torch.where(
+            x < 0,
+            angle + torch.where(y >= 0, torch.full_like(y, pi),
+                                torch.full_like(y, -pi)),
+            angle)
+        angle = torch.where((x == 0) & (y > 0),
+                            torch.full_like(y, pi / 2), angle)
+        angle = torch.where((x == 0) & (y < 0),
+                            torch.full_like(y, -pi / 2), angle)
+        return angle
+
+    @staticmethod
+    def _adaptive_reduce_axis_real(x, target_size, axis):
+        size = x.shape[axis]
+        outputs = []
+        for index in range(target_size):
+            start = index * size // target_size
+            end = ((index + 1) * size + target_size - 1) // target_size
+            window = x.narrow(axis, start, end - start)
+            outputs.append(window.max(dim=axis).values)
+        return torch.stack(outputs, dim=axis)
+
+    @staticmethod
+    def _adaptive_avg_pool_real(x, target_size):
+        """Adaptive average pooling expressed as two matrix multiplications."""
+        height, width = x.shape[-2:]
+        row_weights = []
+        for index in range(target_size):
+            start = index * height // target_size
+            end = ((index + 1) * height + target_size - 1) // target_size
+            row = [0.0] * height
+            value = 1.0 / float(end - start)
+            for offset in range(start, end):
+                row[offset] = value
+            row_weights.append(row)
+        col_weights = []
+        for index in range(target_size):
+            start = index * width // target_size
+            end = ((index + 1) * width + target_size - 1) // target_size
+            row = [0.0] * width
+            value = 1.0 / float(end - start)
+            for offset in range(start, end):
+                row[offset] = value
+            col_weights.append(row)
+        row_weights = torch.tensor(
+            row_weights, dtype=x.dtype, device=x.device)
+        col_weights = torch.tensor(
+            col_weights, dtype=x.dtype, device=x.device)
+        return torch.matmul(torch.matmul(row_weights, x), col_weights.t())
+
+    def _adaptive_pool_combine_real(self, x, target_size):
+        """Adaptive avg/max pooling without MMCV's shape-inference op."""
+        avg_pool = self._adaptive_avg_pool_real(x, target_size)
+        max_pool = self._adaptive_reduce_axis_real(
+            self._adaptive_reduce_axis_real(x, target_size, axis=-2),
+            target_size, axis=-1)
+        return torch.cat([avg_pool, max_pool], dim=1)
+
+    def fft2_filter_with_box_mask_real(self, real, imag, alpha_l, alpha_h):
+        """Apply the same box mask as ``fft2_filter_with_box_mask``."""
+        batch_size, channels, height, width = real.shape
+        assert height == width, 'H not equal W'
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=real.device),
+            torch.arange(width, device=real.device), indexing='ij')
+        lower = (alpha_l * height).view(batch_size, channels, 1, 1)
+        upper = (alpha_h * height).view(batch_size, channels, 1, 1)
+        mask = (((xx < lower) & (yy < lower)) |
+                ((xx > upper) & (yy > upper))).to(real.dtype)
+        return real * mask, imag * mask
 
     def fft_feature_stack(self, fft_feat):
         ff_real = fft_feat.real  # B x C x win x win
@@ -303,6 +471,21 @@ class DyFrFPN(BaseModule):
 
 @NECKS.register_module()
 class DyFrFPN_v2(FPN):
+    # Reuse the real-valued DFT implementation from DyFrFPN.  Keeping these
+    # aliases on the v2 class is important because the AITOD configuration uses
+    # DyFrFPN_v2 and PyTorch 1.11 has no ONNX symbolic for torch.fft.
+    _dft_matrix = staticmethod(DyFrFPN._dft_matrix)
+    _dft_axis_real = DyFrFPN._dft_axis_real
+    _fft2_real = DyFrFPN._fft2_real
+    _ifft2_real = DyFrFPN._ifft2_real
+    predict_alpha_real = DyFrFPN.predict_alpha_real
+    _atan2_real = staticmethod(DyFrFPN._atan2_real)
+    _adaptive_reduce_axis_real = staticmethod(
+        DyFrFPN._adaptive_reduce_axis_real)
+    _adaptive_avg_pool_real = staticmethod(DyFrFPN._adaptive_avg_pool_real)
+    _adaptive_pool_combine_real = DyFrFPN._adaptive_pool_combine_real
+    fft2_filter_with_box_mask_real = DyFrFPN.fft2_filter_with_box_mask_real
+
     def __init__(self,
                  rfp_steps,
                  rfp_backbone,
@@ -409,13 +592,29 @@ class DyFrFPN_v2(FPN):
 
         for lv in range(len(x)):
             feature_fp32 = x[lv].to(torch.float32)
-            ffts = torch.fft.fft2(feature_fp32, norm='ortho')
-            if self.relative:
-                alpha_l, alpha_h = self.predict_alpha_relative(feature_fp32, ffts)
+            if torch.onnx.is_in_onnx_export():
+                # PyTorch 1.11 has no ONNX symbolic for torch.fft.  Express
+                # the same orthonormal FFT, mask and IFFT with real tensors.
+                fft_real, fft_imag = self._fft2_real(feature_fp32)
+                alpha_l, alpha_h = self.predict_alpha_real(
+                    feature_fp32, fft_real, fft_imag, relative=self.relative)
+                filtered_real, filtered_imag = \
+                    self.fft2_filter_with_box_mask_real(
+                        fft_real, fft_imag, alpha_l, alpha_h)
+                newout = self._ifft2_real(
+                    filtered_real, filtered_imag,
+                    output_hw=feature_fp32.shape[-2:])
             else:
-                alpha_l, alpha_h = self.predict_alpha(feature_fp32, ffts)
-            masked_ffts = self.fft2_filter_with_box_mask(ffts, alpha_l, alpha_h)
-            newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
+                ffts = torch.fft.fft2(feature_fp32, norm='ortho')
+                if self.relative:
+                    alpha_l, alpha_h = self.predict_alpha_relative(
+                        feature_fp32, ffts)
+                else:
+                    alpha_l, alpha_h = self.predict_alpha(
+                        feature_fp32, ffts)
+                masked_ffts = self.fft2_filter_with_box_mask(
+                    ffts, alpha_l, alpha_h)
+                newout = torch.fft.ifft2(masked_ffts, norm='ortho').real
             filtered_outs.append(x[lv] - self.beta * newout.half())
 
         return filtered_outs

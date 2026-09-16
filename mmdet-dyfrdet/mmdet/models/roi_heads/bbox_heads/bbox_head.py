@@ -907,6 +907,61 @@ class BBoxUncHead(BaseModule):
     def decode_var(self, bbox_pred_var, mode):
         return bbox_pred_var
 
+    def onnx_export(self,
+                    rois,
+                    cls_score,
+                    bbox_pred_mu,
+                    img_shape,
+                    cfg=None,
+                    **kwargs):
+        """Export uncertainty bbox predictions using the mean regression path.
+
+        The uncertainty branch is useful during training and regular PyTorch
+        inference, but deployment consumes the decoded mean boxes and class
+        scores.  Keep this method tensor-only so it can be called by the
+        standard two-stage detector exporter.
+        """
+        assert rois.ndim == 3, 'ONNX export expects batched RoIs'
+        scores = (self.loss_cls.get_activation(cls_score)
+                  if self.custom_cls_channels else F.softmax(
+                      cls_score, dim=-1))
+        if bbox_pred_mu is None:
+            bboxes = rois[..., 1:].clone()
+        else:
+            bboxes = self.bbox_coder.decode(
+                rois[..., 1:], bbox_pred_mu, max_shape=img_shape)
+
+        from mmdet.core.export import add_dummy_nms_for_onnx
+        scores = scores[..., :self.num_classes]
+        if self.reg_class_agnostic:
+            return add_dummy_nms_for_onnx(
+                bboxes, scores, cfg.max_per_img,
+                cfg.nms.iou_threshold, cfg.score_thr,
+                pre_top_k=cfg.get('deploy_nms_pre', -1),
+                after_top_k=cfg.max_per_img)
+
+        batch_size = scores.shape[0]
+        labels = torch.arange(
+            self.num_classes, dtype=torch.long,
+            device=scores.device).view(1, 1, -1).expand_as(scores)
+        labels = labels.reshape(batch_size, -1)
+        scores = scores.reshape(batch_size, -1)
+        bboxes = bboxes.reshape(batch_size, -1, 4)
+        max_size = torch.max(img_shape)
+        offsets = (labels * max_size + 1).unsqueeze(2)
+        bboxes_for_nms = bboxes + offsets
+        dets, labels = add_dummy_nms_for_onnx(
+            bboxes_for_nms,
+            scores.unsqueeze(2),
+            cfg.max_per_img,
+            cfg.nms.iou_threshold,
+            cfg.score_thr,
+            pre_top_k=cfg.get('deploy_nms_pre', -1),
+            after_top_k=cfg.max_per_img,
+            labels=labels)
+        offsets = (labels * max_size + 1).unsqueeze(2)
+        return torch.cat([dets[..., :4] - offsets, dets[..., 4:5]], dim=2), labels
+
     @force_fp32(apply_to=('cls_score', 'bbox_pred_mu', 'bbox_pred_var'))
     def get_bboxes(self,
                    rois,
